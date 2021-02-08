@@ -65,6 +65,7 @@
 #include <lwip/nd6.h>
 #include <lwip/ip6_frag.h>
 #include <tun2socks/SocksUdpGwClient.h>
+#include <socks_udp_client/SocksUdpClient.h>
 
 #ifndef BADVPN_USE_WINAPI
 #include <base/BLog_syslog.h>
@@ -197,6 +198,7 @@ struct {
     int udpgw_max_connections;
     int udpgw_connection_buffer_size;
     int udpgw_transparent_dns;
+    int socks5_udp;
 #ifdef __ANDROID__
     int tun_mtu;
     int fake_proc;
@@ -270,9 +272,16 @@ uint8_t *device_write_buf;
 SinglePacketBuffer device_read_buffer;
 PacketPassInterface device_read_interface;
 
+// UDP support mode
+enum UdpMode {UdpModeNone, UdpModeUdpgw, UdpModeSocks};
+enum UdpMode udp_mode;
+
 // udpgw client
 SocksUdpGwClient udpgw_client;
 int udp_mtu;
+
+// SOCKS5-UDP client
+SocksUdpClient socks_udp_client;
 
 // TCP timer
 BTimer tcp_timer;
@@ -340,7 +349,7 @@ static void client_socks_recv_initiate (struct tcp_client *client);
 static void client_socks_recv_handler_done (struct tcp_client *client, int data_len);
 static int client_socks_recv_send_out (struct tcp_client *client);
 static err_t client_sent_func (void *arg, struct tcp_pcb *tpcb, u16_t len);
-static void udpgw_client_handler_received (void *unused, BAddr local_addr, BAddr remote_addr, const uint8_t *data, int data_len);
+static void udp_send_packet_to_device (void *unused, BAddr local_addr, BAddr remote_addr, const uint8_t *data, int data_len);
 
 #ifdef __ANDROID__
 static void daemonize(const char* path) {
@@ -609,6 +618,7 @@ int main (int argc, char **argv)
     }
 
     if (options.udpgw_remote_server_addr) {
+        udp_mode = UdpModeUdpgw;
         // compute maximum UDP payload size we need to pass through udpgw
         udp_mtu = BTap_GetMTU(&device) - (int)(sizeof(struct ipv4_header) + sizeof(struct udp_header));
         if (options.netif_ip6addr) {
@@ -636,6 +646,15 @@ int main (int argc, char **argv)
             BLog(BLOG_ERROR, "SocksUdpGwClient_Init failed");
             goto fail4a;
         }
+    } else if (options.socks5_udp) {
+        udp_mode = UdpModeSocks;
+
+        // init SOCKS UDP client
+        SocksUdpClient_Init(&socks_udp_client, udp_mtu, DEFAULT_UDPGW_MAX_CONNECTIONS,
+            SOCKS_UDP_SEND_BUFFER_PACKETS, UDPGW_KEEPALIVE_TIME, socks_server_addr,
+            socks_auth_info, socks_num_auth_info, &ss, NULL, udp_send_packet_to_device);
+    } else {
+        udp_mode = UdpModeNone;
     }
 
     // init lwip init job
@@ -704,8 +723,10 @@ int main (int argc, char **argv)
 
 fail5:
     BPending_Free(&lwip_init_job);
-    if (options.udpgw_remote_server_addr) {
+    if (udp_mode == UdpModeUdpgw) {
         SocksUdpGwClient_Free(&udpgw_client);
+    } else if (udp_mode == UdpModeSocks) {
+        SocksUdpClient_Free(&socks_udp_client);
     }
 fail4a:
     SinglePacketBuffer_Free(&device_read_buffer);
@@ -781,7 +802,7 @@ void print_help (const char *name)
         "        [--udpgw-max-connections <number>]\n"
         "        [--udpgw-connection-buffer-size <number>]\n"
         "        [--udpgw-transparent-dns]\n"
-#endif
+        "        [--socks5-udp]\n"
         "Address format is a.b.c.d:port (IPv4) or [addr]:port (IPv6).\n",
         name
     );
@@ -829,7 +850,8 @@ int parse_arguments (int argc, char *argv[])
     options.udpgw_max_connections = DEFAULT_UDPGW_MAX_CONNECTIONS;
     options.udpgw_connection_buffer_size = DEFAULT_UDPGW_CONNECTION_BUFFER_SIZE;
     options.udpgw_transparent_dns = 0;
-
+    options.socks5_udp = 0;
+    
     int i;
     for (i = 1; i < argc; i++) {
         char *arg = argv[i];
@@ -1058,6 +1080,9 @@ int parse_arguments (int argc, char *argv[])
             options.udpgw_transparent_dns = 1;
         }
 #endif
+        else if (!strcmp(arg, "--socks5-udp")) {
+            options.socks5_udp = 1;
+        }
         else {
             fprintf(stderr, "unknown option: %s\n", arg);
             return 0;
@@ -1411,9 +1436,9 @@ void device_read_handler_send (void *unused, uint8_t *data, int data_len)
 int process_device_udp_packet (uint8_t *data, int data_len)
 {
     ASSERT(data_len >= 0)
-
-    // do nothing if we don't have udpgw
-    if (!options.udpgw_remote_server_addr) {
+    
+    // do nothing if we don't use udpgw or SOCKS UDP
+    if (udp_mode == UdpModeNone) {
         goto fail;
     }
 
@@ -1528,10 +1553,15 @@ int process_device_udp_packet (uint8_t *data, int data_len)
         BLog(BLOG_ERROR, "packet is too large, cannot send to udpgw");
         goto fail;
     }
-
-    // submit packet to udpgw
-    SocksUdpGwClient_SubmitPacket(&udpgw_client, local_addr, remote_addr, is_dns, data, data_len);
-
+    
+    // submit packet to udpgw or SOCKS UDP
+    if (udp_mode == UdpModeUdpgw) {
+        SocksUdpGwClient_SubmitPacket(&udpgw_client, local_addr, remote_addr,
+                                      is_dns, data, data_len);
+    } else if (udp_mode == UdpModeSocks) {
+        SocksUdpClient_SubmitPacket(&socks_udp_client, local_addr, remote_addr, data, data_len);
+    }
+    
     return 1;
 
 fail:
@@ -1678,8 +1708,10 @@ err_t listener_accept_func (void *arg, struct tcp_pcb *newpcb, err_t err)
     }
 
     // init SOCKS
-    if (!BSocksClient_Init(&client->socks_client, socks_server_addr, socks_auth_info, socks_num_auth_info,
-                           addr, (BSocksClient_handler)client_socks_handler, client, &ss)) {
+    if (!BSocksClient_Init(&client->socks_client,
+        socks_server_addr, socks_auth_info, socks_num_auth_info, addr, /*udp=*/false,
+        (BSocksClient_handler)client_socks_handler, client, &ss))
+    {
         BLog(BLOG_ERROR, "listener accept: BSocksClient_Init failed");
         goto fail1;
     }
@@ -2193,13 +2225,15 @@ out:
     return (DEAD_KILLED > 0) ? ERR_ABRT : ERR_OK;
 }
 
-void udpgw_client_handler_received (void *unused, BAddr local_addr, BAddr remote_addr, const uint8_t *data, int data_len)
+void udp_send_packet_to_device (void *unused, BAddr local_addr, BAddr remote_addr, const uint8_t *data, int data_len)
 {
-    ASSERT(options.udpgw_remote_server_addr)
+    ASSERT(udp_mode != UdpModeNone)
     ASSERT(local_addr.type == BADDR_TYPE_IPV4 || local_addr.type == BADDR_TYPE_IPV6)
     ASSERT(local_addr.type == remote_addr.type)
     ASSERT(data_len >= 0)
 
+    char const *source_name = (udp_mode == UdpModeUdpgw) ? "udpgw" : "SOCKS UDP";
+    
     int packet_length = 0;
 
     switch (local_addr.type) {
